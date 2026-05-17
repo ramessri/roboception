@@ -1,0 +1,11 @@
+[project]
+name = "roboception"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "opencv-python>=4.13.0.92",
+    "pytest>=9.0.3",
+    "ultralytics>=8.4.51",
+]

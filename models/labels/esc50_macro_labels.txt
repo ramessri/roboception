@@ -1,0 +1,4 @@
+silence
+human
+appliance
+alert
