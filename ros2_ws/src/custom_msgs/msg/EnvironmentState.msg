@@ -1,0 +1,14 @@
+std_msgs/Header header
+string env_state
+string vision_label
+float32 vision_confidence
+string audio_label
+float32 audio_confidence
+string imu_label
+float32 imu_confidence
+string fusion_reason
+float32 bandwidth_raw_kbps
+float32 bandwidth_actual_kbps
+float32 bandwidth_saved_pct
+uint32 frames_received
+uint32 frames_processed

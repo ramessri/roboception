@@ -30,3 +30,7 @@ rosbag2_*/
 
 # Plan
 PLAN.md
+#build
+build/
+install/
+log/

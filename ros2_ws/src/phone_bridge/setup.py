@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'camera_bridge = phone_bridge.camera_bridge_node:main',
         ],
     },
 )
