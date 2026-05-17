@@ -1,17 +1,6 @@
 """
-ROS2 + FastAPI in one process.
-
-- rclpy runs in a background thread, populates `state` under `state_lock`.
-- uvicorn runs FastAPI on the main thread; WebSocket clients poll `state`
-  at 2 Hz and receive JSON snapshots.
-
-Subscribes to:
-  /ml/vision         — vision classifier output
-  /ml/audio          — audio classifier output
-  /ml/imu            — imu classifier output
-  /environment/state — fused environment state from aggregator
-
-Renders a banner with the fused state above a deck of three modality cards.
+ROS2 + FastAPI in one process. Renders fused state banner, three modality
+cards, and a bandwidth telemetry panel.
 """
 import asyncio
 import json
@@ -28,7 +17,6 @@ import uvicorn
 from custom_msgs.msg import MLClassification, EnvironmentState
 
 
-# ── Shared state ─────────────────────────────────────────────────────
 state = {
     'env_state': 'CALM',
     'fusion_reason': '',
@@ -44,11 +32,16 @@ state = {
     'imu_label': 'unknown',
     'imu_confidence': 0.0,
     'imu_inference_ms': 0.0,
+
+    'bw_raw_kbps': 0.0,
+    'bw_actual_kbps': 0.0,
+    'bw_saved_pct': 0.0,
+    'frames_received': 0,
+    'frames_processed': 0,
 }
 state_lock = threading.Lock()
 
 
-# ── ROS node ─────────────────────────────────────────────────────────
 class DashboardNode(Node):
     def __init__(self):
         super().__init__('dashboard')
@@ -59,19 +52,11 @@ class DashboardNode(Node):
             depth=1,
         )
 
-        self.sub_vision = self.create_subscription(
-            MLClassification, '/ml/vision', self.on_vision, qos
-        )
-        self.sub_audio = self.create_subscription(
-            MLClassification, '/ml/audio', self.on_audio, qos
-        )
-        self.sub_imu = self.create_subscription(
-            MLClassification, '/ml/imu', self.on_imu, qos
-        )
-        self.sub_env = self.create_subscription(
-            EnvironmentState, '/environment/state', self.on_env, qos
-        )
-
+        self.create_subscription(MLClassification, '/ml/vision', self.on_vision, qos)
+        self.create_subscription(MLClassification, '/ml/audio',  self.on_audio,  qos)
+        self.create_subscription(MLClassification, '/ml/imu',    self.on_imu,    qos)
+        self.create_subscription(EnvironmentState, '/environment/state',
+                                 self.on_env, qos)
         self.get_logger().info('dashboard ROS node ready')
 
     def on_vision(self, msg):
@@ -96,9 +81,13 @@ class DashboardNode(Node):
         with state_lock:
             state['env_state'] = msg.env_state
             state['fusion_reason'] = msg.fusion_reason
+            state['bw_raw_kbps'] = msg.bandwidth_raw_kbps
+            state['bw_actual_kbps'] = msg.bandwidth_actual_kbps
+            state['bw_saved_pct'] = msg.bandwidth_saved_pct
+            state['frames_received'] = msg.frames_received
+            state['frames_processed'] = msg.frames_processed
 
 
-# ── FastAPI app ──────────────────────────────────────────────────────
 app = FastAPI()
 
 INDEX_HTML = """
@@ -113,20 +102,20 @@ INDEX_HTML = """
          display: flex; align-items: center; justify-content: center;
          min-height: 100vh; margin: 0; padding: 20px; }
   .wrap { display: flex; flex-direction: column; align-items: center;
-          width: 100%; }
+          width: 100%; max-width: 1000px; }
   .banner { margin-bottom: 28px; text-align: center;
             padding: 22px 40px; border-radius: 14px;
             background: #18181b; border: 1px solid #2a2a2e;
             min-width: 600px; transition: background 0.4s, border-color 0.4s; }
-  .banner-state { font-size: 1.8rem; font-weight: 700;
-                  letter-spacing: 0.1em; }
+  .banner-state { font-size: 1.8rem; font-weight: 700; letter-spacing: 0.1em; }
   .banner-reason { font-size: 0.85rem; color: #888; margin-top: 6px;
                    min-height: 1.1rem; }
   .banner.calm  { background: #18181b; border-color: #2a2a2e; }
   .banner.event { background: #1e3a5f; border-color: #3b82f6; }
   .banner.alert { background: #5f1e1e; border-color: #ef4444; }
   .banner.warn  { background: #5f4a1e; border-color: #f59e0b; }
-  .deck { display: flex; gap: 24px; flex-wrap: wrap; justify-content: center; }
+  .deck { display: flex; gap: 24px; flex-wrap: wrap;
+          justify-content: center; margin-bottom: 28px; }
   .card { background: #18181b; border: 1px solid #2a2a2e;
           border-radius: 14px; padding: 28px 32px;
           width: 280px; text-align: center; }
@@ -137,6 +126,18 @@ INDEX_HTML = """
   .conf  { font-size: 1.1rem; color: #b8b8c0; margin-top: 14px; }
   .meta  { font-size: 0.75rem; color: #555; margin-top: 16px;
            letter-spacing: 0.05em; }
+  .bw    { background: #18181b; border: 1px solid #2a2a2e;
+           border-radius: 14px; padding: 22px 36px;
+           min-width: 600px; }
+  .bw-title { font-size: 0.75rem; color: #888;
+              letter-spacing: 0.25em; margin-bottom: 14px; text-align: center; }
+  .bw-row { display: flex; justify-content: space-around;
+            align-items: baseline; gap: 20px; }
+  .bw-cell { text-align: center; flex: 1; }
+  .bw-num   { font-size: 1.6rem; font-weight: 600; }
+  .bw-num.savings { color: #4ade80; }
+  .bw-lbl   { font-size: 0.7rem; color: #666; letter-spacing: 0.15em;
+              margin-top: 4px; }
   .conn  { position: fixed; top: 16px; right: 20px;
            font-size: 0.7rem; color: #555; letter-spacing: 0.1em; }
   .live  { color: #4ade80; }
@@ -169,6 +170,27 @@ INDEX_HTML = """
       <p class="meta"  id="imu_meta">—</p>
     </div>
   </div>
+  <div class="bw">
+    <div class="bw-title">BANDWIDTH</div>
+    <div class="bw-row">
+      <div class="bw-cell">
+        <div class="bw-num" id="bw_raw">—</div>
+        <div class="bw-lbl">RAW Kbps</div>
+      </div>
+      <div class="bw-cell">
+        <div class="bw-num" id="bw_actual">—</div>
+        <div class="bw-lbl">ACTUAL Kbps</div>
+      </div>
+      <div class="bw-cell">
+        <div class="bw-num savings" id="bw_saved">—</div>
+        <div class="bw-lbl">SAVED</div>
+      </div>
+      <div class="bw-cell">
+        <div class="bw-num" id="bw_frames">—</div>
+        <div class="bw-lbl">FRAMES / S</div>
+      </div>
+    </div>
+  </div>
 </div>
 <script>
 const STATE_CLASS = {
@@ -184,13 +206,11 @@ const setText = (id, v) => { document.getElementById(id).textContent = v; };
 
 ws.onopen = () => {
   const c = document.getElementById('conn');
-  c.textContent = 'LIVE';
-  c.classList.add('live');
+  c.textContent = 'LIVE'; c.classList.add('live');
 };
 ws.onclose = () => {
   const c = document.getElementById('conn');
-  c.textContent = 'DISCONNECTED';
-  c.classList.remove('live');
+  c.textContent = 'DISCONNECTED'; c.classList.remove('live');
 };
 ws.onmessage = (e) => {
   const s = JSON.parse(e.data);
@@ -203,9 +223,13 @@ ws.onmessage = (e) => {
 
   setText('env_state', s.env_state);
   setText('fusion_reason', s.fusion_reason || 'no events');
+  document.getElementById('banner').className =
+    'banner ' + (STATE_CLASS[s.env_state] || 'calm');
 
-  const banner = document.getElementById('banner');
-  banner.className = 'banner ' + (STATE_CLASS[s.env_state] || 'calm');
+  setText('bw_raw',    s.bw_raw_kbps.toFixed(1));
+  setText('bw_actual', s.bw_actual_kbps.toFixed(1));
+  setText('bw_saved',  `${s.bw_saved_pct.toFixed(0)}%`);
+  setText('bw_frames', `${s.frames_processed} / ${s.frames_received}`);
 };
 </script>
 </body>
@@ -231,7 +255,6 @@ async def ws_endpoint(ws: WebSocket):
         pass
 
 
-# ── Glue ─────────────────────────────────────────────────────────────
 def ros_thread_main():
     rclpy.init()
     node = DashboardNode()
