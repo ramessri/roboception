@@ -1,12 +1,21 @@
 """
 ROS2 + FastAPI in one process.
-- rclpy runs in a background thread, populates self.state under self.state_lock.
-- FastAPI runs uvicorn on the main thread, reads state on each WS tick.
+
+- rclpy runs in a background thread, populates `state` under `state_lock`.
+- uvicorn runs FastAPI on the main thread; WebSocket clients poll `state`
+  at 2 Hz and receive JSON snapshots.
+
+Subscribes to:
+  /ml/vision         — vision classifier output
+  /ml/audio          — audio classifier output
+  /ml/imu            — imu classifier output
+  /environment/state — fused environment state from aggregator
+
+Renders a banner with the fused state above a deck of three modality cards.
 """
 import asyncio
 import json
 import threading
-from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -16,18 +25,30 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import uvicorn
 
-from custom_msgs.msg import MLClassification
+from custom_msgs.msg import MLClassification, EnvironmentState
 
 
-# Shared state — accessed by both ROS thread and FastAPI thread.
+# ── Shared state ─────────────────────────────────────────────────────
 state = {
+    'env_state': 'CALM',
+    'fusion_reason': '',
+
     'vision_label': 'unknown',
     'vision_confidence': 0.0,
     'vision_inference_ms': 0.0,
+
+    'audio_label': 'unknown',
+    'audio_confidence': 0.0,
+    'audio_inference_ms': 0.0,
+
+    'imu_label': 'unknown',
+    'imu_confidence': 0.0,
+    'imu_inference_ms': 0.0,
 }
 state_lock = threading.Lock()
 
 
+# ── ROS node ─────────────────────────────────────────────────────────
 class DashboardNode(Node):
     def __init__(self):
         super().__init__('dashboard')
@@ -41,6 +62,16 @@ class DashboardNode(Node):
         self.sub_vision = self.create_subscription(
             MLClassification, '/ml/vision', self.on_vision, qos
         )
+        self.sub_audio = self.create_subscription(
+            MLClassification, '/ml/audio', self.on_audio, qos
+        )
+        self.sub_imu = self.create_subscription(
+            MLClassification, '/ml/imu', self.on_imu, qos
+        )
+        self.sub_env = self.create_subscription(
+            EnvironmentState, '/environment/state', self.on_env, qos
+        )
+
         self.get_logger().info('dashboard ROS node ready')
 
     def on_vision(self, msg):
@@ -48,6 +79,23 @@ class DashboardNode(Node):
             state['vision_label'] = msg.label
             state['vision_confidence'] = msg.confidence
             state['vision_inference_ms'] = msg.inference_ms
+
+    def on_audio(self, msg):
+        with state_lock:
+            state['audio_label'] = msg.label
+            state['audio_confidence'] = msg.confidence
+            state['audio_inference_ms'] = msg.inference_ms
+
+    def on_imu(self, msg):
+        with state_lock:
+            state['imu_label'] = msg.label
+            state['imu_confidence'] = msg.confidence
+            state['imu_inference_ms'] = msg.inference_ms
+
+    def on_env(self, msg):
+        with state_lock:
+            state['env_state'] = msg.env_state
+            state['fusion_reason'] = msg.fusion_reason
 
 
 # ── FastAPI app ──────────────────────────────────────────────────────
@@ -59,35 +107,105 @@ INDEX_HTML = """
 <head>
 <title>Roboception</title>
 <style>
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, system-ui, sans-serif;
-         background: #111; color: #eee;
+         background: #0e0e10; color: #eee;
          display: flex; align-items: center; justify-content: center;
-         height: 100vh; margin: 0; }
-  .card { text-align: center; padding: 40px 80px;
-          border: 1px solid #333; border-radius: 12px; }
-  .label { font-size: 4rem; font-weight: 600; margin: 0; }
-  .conf  { font-size: 1.2rem; color: #888; margin-top: 10px; }
-  .meta  { font-size: 0.9rem; color: #555; margin-top: 30px; }
+         min-height: 100vh; margin: 0; padding: 20px; }
+  .wrap { display: flex; flex-direction: column; align-items: center;
+          width: 100%; }
+  .banner { margin-bottom: 28px; text-align: center;
+            padding: 22px 40px; border-radius: 14px;
+            background: #18181b; border: 1px solid #2a2a2e;
+            min-width: 600px; transition: background 0.4s, border-color 0.4s; }
+  .banner-state { font-size: 1.8rem; font-weight: 700;
+                  letter-spacing: 0.1em; }
+  .banner-reason { font-size: 0.85rem; color: #888; margin-top: 6px;
+                   min-height: 1.1rem; }
+  .banner.calm  { background: #18181b; border-color: #2a2a2e; }
+  .banner.event { background: #1e3a5f; border-color: #3b82f6; }
+  .banner.alert { background: #5f1e1e; border-color: #ef4444; }
+  .banner.warn  { background: #5f4a1e; border-color: #f59e0b; }
+  .deck { display: flex; gap: 24px; flex-wrap: wrap; justify-content: center; }
+  .card { background: #18181b; border: 1px solid #2a2a2e;
+          border-radius: 14px; padding: 28px 32px;
+          width: 280px; text-align: center; }
+  .modality-name { font-size: 0.75rem; color: #888;
+                   letter-spacing: 0.25em; margin-bottom: 18px; }
+  .label { font-size: 2.6rem; font-weight: 600; margin: 0;
+           min-height: 3.4rem; line-height: 1.2; word-break: break-word; }
+  .conf  { font-size: 1.1rem; color: #b8b8c0; margin-top: 14px; }
+  .meta  { font-size: 0.75rem; color: #555; margin-top: 16px;
+           letter-spacing: 0.05em; }
+  .conn  { position: fixed; top: 16px; right: 20px;
+           font-size: 0.7rem; color: #555; letter-spacing: 0.1em; }
+  .live  { color: #4ade80; }
 </style>
 </head>
 <body>
-<div class="card">
-  <p class="label" id="label">—</p>
-  <p class="conf"  id="conf">—</p>
-  <p class="meta"  id="meta">connecting...</p>
+<div class="conn" id="conn">CONNECTING</div>
+<div class="wrap">
+  <div class="banner calm" id="banner">
+    <div class="banner-state" id="env_state">—</div>
+    <div class="banner-reason" id="fusion_reason">—</div>
+  </div>
+  <div class="deck">
+    <div class="card">
+      <div class="modality-name">VISION</div>
+      <p class="label" id="vision_label">—</p>
+      <p class="conf"  id="vision_conf">—</p>
+      <p class="meta"  id="vision_meta">—</p>
+    </div>
+    <div class="card">
+      <div class="modality-name">AUDIO</div>
+      <p class="label" id="audio_label">—</p>
+      <p class="conf"  id="audio_conf">—</p>
+      <p class="meta"  id="audio_meta">—</p>
+    </div>
+    <div class="card">
+      <div class="modality-name">IMU</div>
+      <p class="label" id="imu_label">—</p>
+      <p class="conf"  id="imu_conf">—</p>
+      <p class="meta"  id="imu_meta">—</p>
+    </div>
+  </div>
 </div>
 <script>
+const STATE_CLASS = {
+  'AUDIO_TRIGGERED': 'alert',
+  'IMU_DISTURBANCE': 'warn',
+  'VISUAL_EVENT': 'event',
+  'MULTIMODAL_DISAGREEMENT': 'warn',
+  'CALM': 'calm',
+};
+
 const ws = new WebSocket(`ws://${location.host}/ws`);
-ws.onmessage = (e) => {
-  const s = JSON.parse(e.data);
-  document.getElementById('label').textContent = s.vision_label;
-  document.getElementById('conf').textContent =
-    `confidence ${(s.vision_confidence * 100).toFixed(0)}%`;
-  document.getElementById('meta').textContent =
-    `inference ${s.vision_inference_ms.toFixed(1)} ms`;
+const setText = (id, v) => { document.getElementById(id).textContent = v; };
+
+ws.onopen = () => {
+  const c = document.getElementById('conn');
+  c.textContent = 'LIVE';
+  c.classList.add('live');
 };
 ws.onclose = () => {
-  document.getElementById('meta').textContent = 'disconnected';
+  const c = document.getElementById('conn');
+  c.textContent = 'DISCONNECTED';
+  c.classList.remove('live');
+};
+ws.onmessage = (e) => {
+  const s = JSON.parse(e.data);
+
+  for (const m of ['vision', 'audio', 'imu']) {
+    setText(`${m}_label`, s[`${m}_label`]);
+    setText(`${m}_conf`,  `${(s[`${m}_confidence`] * 100).toFixed(0)}% confidence`);
+    setText(`${m}_meta`,  `inference ${s[`${m}_inference_ms`].toFixed(1)} ms`);
+  }
+
+  setText('env_state', s.env_state);
+  setText('fusion_reason', s.fusion_reason || 'no events');
+
+  const banner = document.getElementById('banner');
+  banner.className = 'banner ' + (STATE_CLASS[s.env_state] || 'calm');
 };
 </script>
 </body>
@@ -108,7 +226,7 @@ async def ws_endpoint(ws: WebSocket):
             with state_lock:
                 snapshot = dict(state)
             await ws.send_text(json.dumps(snapshot))
-            await asyncio.sleep(0.5)  # 2 Hz updates
+            await asyncio.sleep(0.5)
     except WebSocketDisconnect:
         pass
 
@@ -127,8 +245,6 @@ def ros_thread_main():
 def main():
     ros_thread = threading.Thread(target=ros_thread_main, daemon=True)
     ros_thread.start()
-
-    # uvicorn blocks the main thread, which is what we want.
     uvicorn.run(app, host='0.0.0.0', port=8765, log_level='warning')
 
 
