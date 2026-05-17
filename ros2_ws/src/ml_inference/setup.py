@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'vision_detector = ml_inference.vision_detector_node:main',
         ],
     },
 )
