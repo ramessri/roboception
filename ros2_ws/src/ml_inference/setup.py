@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'vision_detector = ml_inference.vision_detector_node:main',
+            'audio_classifier = ml_inference.audio_classifier_node:main',
         ],
     },
 )

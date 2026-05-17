@@ -22,6 +22,7 @@ models/imu_model.onnx
 # Training data (downloaded by training scripts)
 training/data/
 *.zip
+audio_model.onnx.data
 
 # Local config
 .env
