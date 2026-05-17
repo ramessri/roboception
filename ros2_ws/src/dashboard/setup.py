@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'dashboard = dashboard.dashboard_node:main',
         ],
     },
 )
