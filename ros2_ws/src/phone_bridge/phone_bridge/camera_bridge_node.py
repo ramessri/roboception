@@ -16,13 +16,13 @@ import cv2
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Bool, Float32MultiArray
 from cv_bridge import CvBridge
 
 
-BASE_RATE = 5.0                  # Hz — idle rate
-BOOST_RATE = 15.0                # Hz — boosted rate on audio events
+BASE_RATE = 15.0                 # Hz — idle rate (min needed for VI-SLAM tracking)
+BOOST_RATE = 30.0                # Hz — boosted rate on audio events
 BOOST_DURATION_SEC = 5.0         # how long a single boost lasts
 TELEMETRY_PERIOD_SEC = 1.0       # how often to publish bandwidth stats
 TICK_PERIOD = 1.0 / 30.0         # internal tick rate; publishes are decimated from here
@@ -48,6 +48,31 @@ class CameraBridgeNode(Node):
         )
 
         self.pub_image = self.create_publisher(Image, '/camera/image_raw', qos_pub)
+        self.pub_camera_info = self.create_publisher(CameraInfo, '/camera/camera_info', qos_pub)
+
+        # Approximate intrinsics for your phone at 640x400.
+        # fx=fy=554 assumes ~60° horizontal FOV — good enough for RTAB to start.
+        # Replace with real values after you run camera_calibration once.
+        self._camera_info = CameraInfo()
+        self._camera_info.header.frame_id = 'phone_camera'
+        self._camera_info.width  = 640
+        self._camera_info.height = 400
+        self._camera_info.distortion_model = 'plumb_bob'
+        self._camera_info.d = [0.0, 0.0, 0.0, 0.0, 0.0]   # no distortion assumed
+        self._camera_info.k = [
+            554.0,   0.0, 320.0,
+            0.0, 554.0, 200.0,
+            0.0,   0.0,   1.0,
+        ]
+        self._camera_info.r = [1.0, 0.0, 0.0,
+                                0.0, 1.0, 0.0,
+                                0.0, 0.0, 1.0]
+        self._camera_info.p = [
+            554.0,   0.0, 320.0, 0.0,
+            0.0, 554.0, 200.0, 0.0,
+            0.0,   0.0,   1.0, 0.0,
+        ]
+
         self.pub_telemetry = self.create_publisher(
             Float32MultiArray, '/camera/telemetry', qos_pub
         )
@@ -131,6 +156,9 @@ class CameraBridgeNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'phone_camera'
         self.pub_image.publish(msg)
+
+        self._camera_info.header.stamp = msg.header.stamp   # same timestamp as image
+        self.pub_camera_info.publish(self._camera_info)
 
         self.bytes_published_total += frame_bytes
         self.frames_published += 1
