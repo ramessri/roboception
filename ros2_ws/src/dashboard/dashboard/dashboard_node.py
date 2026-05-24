@@ -230,7 +230,7 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#0e0e10;color:#ee
 
 .panel{background:#18181b;border:1px solid #2a2a2e;border-radius:14px;overflow:hidden}
 .panel-title{font-size:.7rem;color:#888;letter-spacing:.25em;padding:10px 14px 8px;border-bottom:1px solid #2a2a2e}
-#cam-img{width:100%;display:block;aspect-ratio:16/10;object-fit:cover;background:#000}
+#cam-img{max-height:600px;width:auto;margin:0 auto;display:block;aspect-ratio:16/10;object-fit:cover;background:#000}
 .no-feed{aspect-ratio:16/10;display:flex;align-items:center;justify-content:center;color:#444;font-size:.8rem;letter-spacing:.2em}
 
 .deck{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
