@@ -1,10 +1,7 @@
 """
 Subscribes to /camera/image_raw, runs YOLOv8n via ONNX Runtime,
-publishes top detection on /ml/vision as custom_msgs/MLClassification.
-
-Maps the 80 COCO classes to a single scene-level label by picking the
-highest-confidence detection in the frame. If nothing crosses the
-confidence threshold, label is 'empty'.
+publishes top detection on /ml/vision as custom_msgs/MLClassification,
+and publishes an annotated image with bounding boxes on /camera/annotated.
 """
 import time
 from pathlib import Path
@@ -18,6 +15,12 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from custom_msgs.msg import MLClassification
+
+# Colour palette — one colour per class, cycling modulo 80.
+_PALETTE = [
+    (0, 255, 80), (255, 80, 0), (0, 180, 255), (255, 220, 0),
+    (180, 0, 255), (0, 255, 200), (255, 100, 100), (100, 255, 100),
+]
 
 
 class VisionDetectorNode(Node):
@@ -48,17 +51,14 @@ class VisionDetectorNode(Node):
         assert len(self.labels) == 80, f'expected 80 COCO labels, got {len(self.labels)}'
 
         # ── Load ONNX model ───────────────────────────────────────
-        # CPUExecutionProvider only — WSL2 doesn't have CUDA passthrough by
-        # default. On a real robot you'd add 'CUDAExecutionProvider' first
-        # and let onnxruntime pick the best available.
         self.session = ort.InferenceSession(
             model_path,
             providers=['CPUExecutionProvider'],
         )
-        self.input_name = self.session.get_inputs()[0].name  # 'images'
+        self.input_name = self.session.get_inputs()[0].name
         self.get_logger().info(f'loaded {model_path}')
 
-        # ── QoS: BEST_EFFORT to match camera_bridge ───────────────
+        # ── QoS ───────────────────────────────────────────────────
         qos_sub = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -72,6 +72,7 @@ class VisionDetectorNode(Node):
 
         self.bridge = CvBridge()
         self.pub = self.create_publisher(MLClassification, '/ml/vision', qos_pub)
+        self.pub_annotated = self.create_publisher(Image, '/camera/annotated', qos_pub)
         self.sub = self.create_subscription(
             Image, '/camera/image_raw', self.on_image, qos_sub
         )
@@ -80,53 +81,35 @@ class VisionDetectorNode(Node):
 
     # ── Preprocessing ────────────────────────────────────────────
     def preprocess(self, frame_bgr):
-        """
-        BGR (H, W, 3) uint8 → (1, 3, 640, 640) float32 in [0,1], RGB.
-        Letterbox: scale preserving aspect ratio, pad with gray.
-        Returns (tensor, scale, pad_x, pad_y) — scale/pad needed to map
-        boxes back to original image coords later (unused in this demo
-        because we don't draw boxes, but kept for clarity).
-        """
         h, w = frame_bgr.shape[:2]
         scale = self.input_size / max(h, w)
         new_w, new_h = int(w * scale), int(h * scale)
         resized = cv2.resize(frame_bgr, (new_w, new_h))
 
-        # Pad to square 640x640
         pad_x = (self.input_size - new_w) // 2
         pad_y = (self.input_size - new_h) // 2
         canvas = np.full((self.input_size, self.input_size, 3), 114, dtype=np.uint8)
         canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
 
-        # BGR → RGB, HWC → CHW, uint8 → float32, [0,1]
         rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
         tensor = rgb.astype(np.float32) / 255.0
-        tensor = tensor.transpose(2, 0, 1)           # CHW
-        tensor = np.expand_dims(tensor, 0)            # NCHW
+        tensor = tensor.transpose(2, 0, 1)
+        tensor = np.expand_dims(tensor, 0)
         return tensor, scale, pad_x, pad_y
 
     # ── Postprocessing ───────────────────────────────────────────
     def postprocess(self, output):
         """
-        YOLOv8 ONNX output is (1, 84, 8400):
-          - axis 0: batch (1)
-          - axis 1: 4 box coords (cx, cy, w, h) + 80 class scores
-          - axis 2: 8400 candidate boxes
-
-        Returns: list of (class_id, confidence) for surviving boxes after NMS.
+        Returns list of (class_id, confidence, x1, y1, x2, y2) in letterbox space.
+        Box coords are in [0, input_size] range — caller undoes padding/scale.
         """
-        # Transpose to (8400, 84) — one row per candidate.
         preds = output[0].T
-
-        # Split: first 4 cols are bbox, remaining 80 are class scores.
         boxes_xywh = preds[:, :4]
         class_scores = preds[:, 4:]
 
-        # Top class per row + its score.
         class_ids = np.argmax(class_scores, axis=1)
         confidences = np.max(class_scores, axis=1)
 
-        # Filter by confidence threshold.
         mask = confidences >= self.conf_threshold
         if not np.any(mask):
             return []
@@ -135,8 +118,6 @@ class VisionDetectorNode(Node):
         confidences = confidences[mask]
         class_ids = class_ids[mask]
 
-        # cv2.dnn.NMSBoxes wants xywh as [x, y, w, h] with x,y = top-left.
-        # YOLOv8 gives center-xywh, so convert.
         xy_tl = boxes_xywh[:, :2] - boxes_xywh[:, 2:] / 2
         boxes_for_nms = np.concatenate([xy_tl, boxes_xywh[:, 2:]], axis=1)
 
@@ -146,15 +127,17 @@ class VisionDetectorNode(Node):
             self.conf_threshold,
             self.nms_threshold,
         )
-
         if len(indices) == 0:
             return []
 
-        # OpenCV returns indices as np.ndarray in newer versions, flat list in older.
         indices = np.array(indices).flatten()
-
-        results = [(int(class_ids[i]), float(confidences[i])) for i in indices]
-        # Sort by confidence descending.
+        results = []
+        for i in indices:
+            x1 = float(boxes_for_nms[i][0])
+            y1 = float(boxes_for_nms[i][1])
+            x2 = float(x1 + boxes_for_nms[i][2])
+            y2 = float(y1 + boxes_for_nms[i][3])
+            results.append((int(class_ids[i]), float(confidences[i]), x1, y1, x2, y2))
         results.sort(key=lambda x: x[1], reverse=True)
         return results
 
@@ -167,12 +150,30 @@ class VisionDetectorNode(Node):
             self.get_logger().warn(f'cv_bridge: {e}', throttle_duration_sec=2.0)
             return
 
-        tensor, _, _, _ = self.preprocess(frame)
+        tensor, scale, pad_x, pad_y = self.preprocess(frame)
         output = self.session.run(None, {self.input_name: tensor})[0]
         detections = self.postprocess(output)
         inference_ms = (time.time() - t0) * 1000.0
 
-        # Build MLClassification message.
+        # ── Draw bounding boxes ───────────────────────────────────
+        annotated = frame.copy()
+        h_orig, w_orig = frame.shape[:2]
+        for class_id, conf, bx1, by1, bx2, by2 in detections:
+            ox1 = max(0, int((bx1 - pad_x) / scale))
+            oy1 = max(0, int((by1 - pad_y) / scale))
+            ox2 = min(w_orig - 1, int((bx2 - pad_x) / scale))
+            oy2 = min(h_orig - 1, int((by2 - pad_y) / scale))
+            colour = _PALETTE[class_id % len(_PALETTE)]
+            cv2.rectangle(annotated, (ox1, oy1), (ox2, oy2), colour, 2)
+            text = f'{self.labels[class_id]} {conf:.0%}'
+            cv2.putText(annotated, text, (ox1, max(oy1 - 6, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1, cv2.LINE_AA)
+
+        ann_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
+        ann_msg.header = msg.header
+        self.pub_annotated.publish(ann_msg)
+
+        # ── MLClassification ──────────────────────────────────────
         out = MLClassification()
         out.header.stamp = self.get_clock().now().to_msg()
         out.header.frame_id = msg.header.frame_id
@@ -185,13 +186,11 @@ class VisionDetectorNode(Node):
             out.all_labels = []
             out.all_confidences = []
         else:
-            top_class_id, top_conf = detections[0]
-            out.label = self.labels[top_class_id]
-            out.confidence = top_conf
-            # Send up to top 5 for the dashboard.
+            out.label = self.labels[detections[0][0]]
+            out.confidence = detections[0][1]
             top5 = detections[:5]
-            out.all_labels = [self.labels[c] for c, _ in top5]
-            out.all_confidences = [float(c) for _, c in top5]
+            out.all_labels = [self.labels[d[0]] for d in top5]
+            out.all_confidences = [float(d[1]) for d in top5]
 
         self.pub.publish(out)
 
