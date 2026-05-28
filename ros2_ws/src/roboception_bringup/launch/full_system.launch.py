@@ -11,10 +11,15 @@ Optional overrides:
     vision_conf:=0.5 \\
     log_level:=debug
 """
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+_phone_ip = os.environ.get('PHONE_IP', '').strip()
+_default_url = f'http://{_phone_ip}:8080' if _phone_ip else None
 
 
 def generate_launch_description():
@@ -23,11 +28,13 @@ def generate_launch_description():
     vision_conf = LaunchConfiguration('vision_conf')
     log_level = LaunchConfiguration('log_level')
 
+    _url_arg = {'default_value': _default_url} if _default_url else {}
+
     declared_args = [
         DeclareLaunchArgument(
             'phone_url',
-            default_value='http://192.168.0.102:8080',
-            description='Base URL of the IP Webcam server on the phone',
+            description='IP Webcam base URL — or set PHONE_IP env var instead',
+            **_url_arg,
         ),
         DeclareLaunchArgument(
             'vision_conf',

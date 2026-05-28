@@ -1,4 +1,5 @@
 # ros2_ws/src/phone_bridge/phone_bridge/imu_bridge_node.py
+import os
 import requests
 import rclpy
 from rclpy.node import Node
@@ -10,7 +11,9 @@ class ImuBridgeNode(Node):
     def __init__(self):
         super().__init__('imu_bridge')
 
-        self.declare_parameter('phone_url', 'http://192.168.0.102:8080')
+        _ip = os.environ.get('PHONE_IP', '')
+        _default_url = f'http://{_ip}:8080' if _ip else 'http://[set PHONE_IP]'
+        self.declare_parameter('phone_url', _default_url)
         self.declare_parameter('poll_rate_hz', 50.0)
         self.declare_parameter('http_timeout_sec', 1.0)
 
