@@ -1,7 +1,7 @@
 """
 Camera bridge — phone MJPEG → /camera/image_raw + /camera/telemetry.
 
-Base rate: 5 Hz (BASE_RATE). Boost rate: 15 Hz (BOOST_RATE), activated for
+Base rate: 15 Hz (BASE_RATE). Boost rate: 30 Hz (BOOST_RATE), activated for
 BOOST_DURATION_SEC seconds when /camera/boost_rate publishes True.
 
 Telemetry: every TELEMETRY_PERIOD_SEC seconds, publishes a snapshot of
@@ -10,6 +10,7 @@ Telemetry: every TELEMETRY_PERIOD_SEC seconds, publishes a snapshot of
   - frame counts received vs published
 The aggregator consumes this and includes it in /environment/state.
 """
+import os
 import time
 
 import cv2
@@ -32,7 +33,9 @@ class CameraBridgeNode(Node):
     def __init__(self):
         super().__init__('camera_bridge')
 
-        self.declare_parameter('phone_url', 'http://192.168.0.102:8080')
+        _ip = os.environ.get('PHONE_IP', '')
+        _default_url = f'http://{_ip}:8080' if _ip else 'http://[set PHONE_IP]'
+        self.declare_parameter('phone_url', _default_url)
         phone_url = self.get_parameter('phone_url').value
         self.video_url = f'{phone_url}/video'
 
@@ -137,7 +140,7 @@ class CameraBridgeNode(Node):
         # Estimate bytes for "raw" bandwidth — JPEG-encode and measure.
         # We must encode anyway later for /image_raw → cv_bridge converts to
         # raw bytes (large), so we use JPEG-encoded size as the realistic
-        # "what we'd send over network" figure. Defensible interview note.
+        # "what we'd send over network" figure.
         ok, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if ok:
             frame_bytes = len(jpeg.tobytes())
